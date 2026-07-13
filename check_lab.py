@@ -31,6 +31,13 @@ def check_json(path: str, required_keys: list[str]) -> bool:
         if missing:
             print(f"  ❌ {path} thiếu keys: {missing}")
             return False
+        if path.endswith("ragas_report.json") and (
+            data.get("evaluation_backend") != "ragas"
+            or int(data.get("num_questions", 0)) < 20
+            or len(data.get("failures", [])) < 5
+        ):
+            print(f"  ❌ {path} cần RAGAS thật, ít nhất 20 câu và bottom-5")
+            return False
         print(f"  ✅ {path} — keys OK")
         return True
     except (json.JSONDecodeError, FileNotFoundError) as e:
@@ -46,7 +53,7 @@ def check_todos() -> int:
             if f.endswith(".py"):
                 with open(os.path.join(root, f), encoding="utf-8") as fh:
                     for line in fh:
-                        if "# TODO:" in line:
+                        if "TODO" in line:
                             count += 1
     return count
 
@@ -82,14 +89,18 @@ def validate():
     # 1. Source files
     print("📁 Source code:")
     for f in ["src/m1_chunking.py", "src/m2_search.py", "src/m3_rerank.py",
-              "src/m4_eval.py", "src/pipeline.py"]:
+              "src/m4_eval.py", "src/m5_enrichment.py", "src/pipeline.py",
+              "requirements.txt", "docker-compose.yml"]:
         if not check_file(f):
             errors += 1
 
     # 2. Reports
     print("\n📊 Reports:")
     if check_file("reports/ragas_report.json"):
-        if not check_json("reports/ragas_report.json", ["aggregate", "num_questions"]):
+        if not check_json(
+            "reports/ragas_report.json",
+            ["aggregate", "num_questions", "evaluation_backend", "failures"],
+        ):
             errors += 1
     else:
         errors += 1
@@ -97,15 +108,38 @@ def validate():
 
     # 3. Analysis
     print("\n📝 Analysis:")
-    check_file("analysis/failure_analysis.md")
-    check_file("analysis/group_report.md")
+    if not check_file("analysis/failure_analysis.md"):
+        errors += 1
+    if not check_file("analysis/group_report.md"):
+        errors += 1
+
+    print("\n📚 Test set:")
+    try:
+        with open("test_set.json", encoding="utf-8") as f:
+            test_set = json.load(f)
+        valid = (
+            isinstance(test_set, list)
+            and len(test_set) >= 20
+            and all("question" in item and "ground_truth" in item for item in test_set)
+        )
+        print(f"  {'✅' if valid else '❌'} {len(test_set)} câu hỏi")
+        if not valid:
+            errors += 1
+    except (json.JSONDecodeError, FileNotFoundError) as exc:
+        print(f"  ❌ test_set.json — {exc}")
+        errors += 1
 
     # 4. Individual reflections
     print("\n👤 Individual reflections:")
     reflections = []
     ref_dir = "analysis/reflections"
     if os.path.isdir(ref_dir):
-        reflections = [f for f in os.listdir(ref_dir) if f.startswith("reflection_") and f.endswith(".md")]
+        reflections = [
+            f for f in os.listdir(ref_dir)
+            if f.startswith("reflection_")
+            and f.endswith(".md")
+            and f != "reflection_TEMPLATE.md"
+        ]
     if reflections:
         for r in reflections:
             print(f"  ✅ {ref_dir}/{r}")

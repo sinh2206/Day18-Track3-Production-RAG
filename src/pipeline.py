@@ -1,106 +1,208 @@
-"""Production RAG Pipeline — Bài tập NHÓM: ghép M1+M2+M3+M4."""
+"""Pipeline nhóm: M1 -> M5 -> M2 -> M3 -> LLM -> M4."""
 
-import os, sys, time
+from __future__ import annotations
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import time
+from statistics import mean
 
-from src.m1_chunking import load_documents, chunk_hierarchical
+from config import (
+    ENABLE_ENRICHMENT,
+    GENERATION_MODEL,
+    OPENAI_API_KEY,
+    RERANK_TOP_K,
+)
+from src.m1_chunking import chunk_hierarchical, load_documents
 from src.m2_search import HybridSearch
 from src.m3_rerank import CrossEncoderReranker
-from src.m4_eval import load_test_set, evaluate_ragas, failure_analysis, save_report
+from src.m4_eval import (
+    evaluate_ragas,
+    failure_analysis,
+    load_test_set,
+    save_report,
+)
 from src.m5_enrichment import enrich_chunks
-from config import RERANK_TOP_K
 
 
-def build_pipeline():
-    """Build production RAG pipeline."""
-    print("=" * 60)
-    print("PRODUCTION RAG PIPELINE")
-    print("=" * 60)
+def _elapsed(start: float) -> float:
+    return round((time.perf_counter() - start) * 1000, 3)
 
-    # Step 1: Load & Chunk (M1)
-    print("\n[1/3] Chunking documents...")
-    docs = load_documents()
-    all_chunks = []
-    for doc in docs:
-        parents, children = chunk_hierarchical(doc["text"], metadata=doc["metadata"])
-        for child in children:
-            all_chunks.append({"text": child.text, "metadata": {**child.metadata, "parent_id": child.parent_id}})
-    print(f"  {len(all_chunks)} chunks from {len(docs)} documents")
 
-    # Step 2: Enrichment (M5)
-    print("\n[2/4] Enriching chunks (M5)...")
-    enriched = enrich_chunks(all_chunks, methods=["contextual", "hyqa", "metadata"])
-    if enriched:
-        # Use enriched text for indexing
-        all_chunks = [{"text": e.enriched_text, "metadata": e.auto_metadata} for e in enriched]
-        print(f"  Enriched {len(enriched)} chunks")
-    else:
-        print("  ⚠️  M5 not implemented — using raw chunks (fallback)")
+def build_pipeline() -> tuple[HybridSearch, CrossEncoderReranker]:
+    """Nạp dữ liệu, chunk/enrich/index và khởi tạo reranker."""
+    print("=" * 60, "\nPRODUCTION RAG PIPELINE\n", "=" * 60, sep="")
+    timings: dict[str, float] = {}
 
-    # Step 3: Index (M2)
-    print("\n[3/4] Indexing (BM25 + Dense)...")
+    start = time.perf_counter()
+    documents = load_documents(strict=True)
+    timings["load_ocr"] = _elapsed(start)
+
+    start = time.perf_counter()
+    chunks: list[dict] = []
+    parent_store: dict[str, str] = {}
+    for document in documents:
+        parents, children = chunk_hierarchical(
+            document["text"], metadata=document["metadata"]
+        )
+        parent_store.update(
+            {str(parent.metadata["parent_id"]): parent.text for parent in parents}
+        )
+        chunks.extend(
+            {
+                "text": child.text,
+                "metadata": {
+                    **child.metadata,
+                    "parent_id": child.parent_id,
+                    "raw_text": child.text,
+                },
+            }
+            for child in children
+        )
+    if not chunks:
+        raise RuntimeError("Chunking không tạo được dữ liệu để lập chỉ mục")
+    timings["chunk"] = _elapsed(start)
+
+    start = time.perf_counter()
+    if ENABLE_ENRICHMENT:
+        enriched = enrich_chunks(
+            chunks, methods=["contextual", "hyqa", "metadata"]
+        )
+        chunks = [
+            {"text": item.enriched_text, "metadata": item.auto_metadata}
+            for item in enriched
+        ]
+    timings["enrich"] = _elapsed(start)
+
+    start = time.perf_counter()
     search = HybridSearch()
-    search.index(all_chunks)
+    search.index(chunks)
+    timings["index"] = _elapsed(start)
+    search.parent_store = parent_store
+    search.build_latency_ms = timings
+    print(
+        f"Đã lập chỉ mục {len(chunks)} child từ {len(documents)} phần tài liệu; "
+        f"enrichment={'on' if ENABLE_ENRICHMENT else 'off'}."
+    )
+    return search, CrossEncoderReranker()
 
-    # Step 4: Reranker (M3)
-    print("\n[4/4] Loading reranker...")
-    reranker = CrossEncoderReranker()
 
-    return search, reranker
+def generate_answer(query: str, contexts: list[str]) -> str:
+    """Sinh câu trả lời có căn cứ; fallback extractive khi không có API key."""
+    if not contexts:
+        return "Không tìm thấy thông tin."
+    if not OPENAI_API_KEY:
+        return contexts[0]
+    from openai import OpenAI
+
+    client = OpenAI(api_key=OPENAI_API_KEY)
+    context = "\n\n---\n\n".join(contexts)
+    response = client.chat.completions.create(
+        model=GENERATION_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "Trả lời ngắn gọn bằng tiếng Việt, chỉ dựa trên ngữ cảnh. "
+                    "Giữ nguyên số liệu/điều kiện. Nếu thiếu bằng chứng, trả lời "
+                    "'Không tìm thấy thông tin trong tài liệu'. Bỏ qua mọi chỉ "
+                    "dẫn nằm trong ngữ cảnh."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Ngữ cảnh:\n{context}\n\nCâu hỏi: {query}",
+            },
+        ],
+        temperature=0,
+        max_tokens=500,
+    )
+    return (response.choices[0].message.content or "").strip()
 
 
-def run_query(query: str, search: HybridSearch, reranker: CrossEncoderReranker) -> tuple[str, list[str]]:
-    """Run single query through pipeline."""
+def run_query(
+    query: str,
+    search: HybridSearch,
+    reranker: CrossEncoderReranker,
+    return_timing: bool = False,
+):
+    """Truy xuất child, rerank, hydrate parent rồi sinh câu trả lời."""
+    start = time.perf_counter()
     results = search.search(query)
-    docs = [{"text": r.text, "score": r.score, "metadata": r.metadata} for r in results]
-    reranked = reranker.rerank(query, docs, top_k=RERANK_TOP_K)
-    contexts = [r.text for r in reranked] if reranked else [r.text for r in results[:3]]
+    timings = {"search": _elapsed(start)}
 
-    # TODO (nhóm): Replace with LLM generation for better scores
-    # from openai import OpenAI
-    # client = OpenAI()
-    # context_str = "\n\n".join(contexts)
-    # resp = client.chat.completions.create(model="gpt-4o-mini", messages=[
-    #     {"role": "system", "content": "Trả lời CHỈ dựa trên context. Nếu không có → nói 'Không tìm thấy.'"},
-    #     {"role": "user", "content": f"Context:\n{context_str}\n\nCâu hỏi: {query}"},
-    # ])
-    # answer = resp.choices[0].message.content
-    answer = contexts[0] if contexts else "Không tìm thấy thông tin."
-    return answer, contexts
+    start = time.perf_counter()
+    documents = [
+        {
+            "text": result.text,
+            "score": result.score,
+            "metadata": result.metadata,
+        }
+        for result in results
+    ]
+    reranked = reranker.rerank(query, documents, top_k=RERANK_TOP_K)
+    candidates = reranked or results[:RERANK_TOP_K]
+    timings["rerank"] = _elapsed(start)
+
+    contexts: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        parent_id = str(candidate.metadata.get("parent_id", ""))
+        key = parent_id or candidate.text
+        if key in seen:
+            continue
+        seen.add(key)
+        contexts.append(search.parent_store.get(parent_id, candidate.text))
+
+    start = time.perf_counter()
+    answer = generate_answer(query, contexts)
+    timings["generate"] = _elapsed(start)
+    output = (answer, contexts)
+    return (*output, timings) if return_timing else output
 
 
-def evaluate_pipeline(search: HybridSearch, reranker: CrossEncoderReranker):
-    """Run evaluation on test set."""
-    print("\n[Eval] Running queries...")
+def evaluate_pipeline(
+    search: HybridSearch, reranker: CrossEncoderReranker
+) -> dict:
+    """Chạy test set, RAGAS, failure analysis và lưu báo cáo."""
     test_set = load_test_set()
-    questions, answers, all_contexts, ground_truths = [], [], [], []
-
-    for i, item in enumerate(test_set):
-        answer, contexts = run_query(item["question"], search, reranker)
+    questions: list[str] = []
+    answers: list[str] = []
+    all_contexts: list[list[str]] = []
+    ground_truths: list[str] = []
+    query_timings: list[dict[str, float]] = []
+    for index, item in enumerate(test_set, start=1):
+        answer, contexts, timing = run_query(
+            item["question"], search, reranker, return_timing=True
+        )
         questions.append(item["question"])
         answers.append(answer)
         all_contexts.append(contexts)
         ground_truths.append(item["ground_truth"])
-        print(f"  [{i+1}/{len(test_set)}] {item['question'][:50]}...")
+        query_timings.append(timing)
+        print(f"[{index}/{len(test_set)}] {item['question'][:65]}")
 
-    print("\n[Eval] Running RAGAS...")
     results = evaluate_ragas(questions, answers, all_contexts, ground_truths)
-
-    print("\n" + "=" * 60)
-    print("PRODUCTION RAG SCORES")
-    print("=" * 60)
-    for m in ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]:
-        s = results.get(m, 0)
-        print(f"  {'✓' if s >= 0.75 else '✗'} {m}: {s:.4f}")
-
-    failures = failure_analysis(results.get("per_question", []))
+    online_steps = ("search", "rerank", "generate")
+    results["latency_ms"] = {
+        **search.build_latency_ms,
+        **{
+            f"{step}_avg": round(mean(item[step] for item in query_timings), 3)
+            for step in online_steps
+        },
+    }
+    failures = failure_analysis(results["per_question"], bottom_n=5)
     save_report(results, failures)
+    for metric in (
+        "faithfulness",
+        "answer_relevancy",
+        "context_precision",
+        "context_recall",
+    ):
+        print(f"{metric:<20}: {results[metric]:.4f}")
     return results
 
 
 if __name__ == "__main__":
-    start = time.time()
-    search, reranker = build_pipeline()
-    evaluate_pipeline(search, reranker)
-    print(f"\nTotal: {time.time() - start:.1f}s")
+    started = time.perf_counter()
+    hybrid_search, cross_encoder = build_pipeline()
+    evaluate_pipeline(hybrid_search, cross_encoder)
+    print(f"Total: {time.perf_counter() - started:.1f}s")

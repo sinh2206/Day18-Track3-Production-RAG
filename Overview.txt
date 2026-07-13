@@ -1,0 +1,183 @@
+TỔNG QUAN DỰ ÁN LAB 18: PRODUCTION RAG PIPELINE
+================================================
+
+Tài liệu này tổng hợp README.md, RUBRIC.md, ASSIGNMENT_GROUP.md,
+ASSIGNMENT_INDIVIDUAL.md, test_set.json, mã nguồn, các bài kiểm thử và hai thư
+mục data/, analysis/. Nội dung phân biệt rõ thiết kế được yêu cầu với trạng thái
+thực tế của kho mã tại thời điểm khảo sát.
+
+1. MỤC TIÊU DỰ ÁN
+-----------------
+
+Dự án xây dựng một hệ thống RAG dùng cho tài liệu tiếng Việt, tiến từ bản cơ sở
+đơn giản đến một pipeline gần với môi trường thực tế. Hệ thống phải:
+
+- nạp và chia tài liệu thành các đoạn có nghĩa;
+- tìm kiếm bằng cả từ khóa và ngữ nghĩa;
+- hợp nhất, xếp hạng lại các kết quả truy xuất;
+- sinh câu trả lời chỉ dựa trên ngữ cảnh tìm được;
+- đánh giá định lượng bằng RAGAS;
+- phân tích các câu hỏi thất bại để tìm đúng nguyên nhân;
+- so sánh công bằng với bản RAG cơ sở.
+
+Bài gồm hai phần:
+
+- Phần cá nhân, tối đa 60 điểm: mỗi thành viên triển khai một mô-đun, vượt bài
+  kiểm thử, xử lý tốt tiếng Việt, bảo đảm chất lượng mã và xóa TODO.
+- Phần nhóm, tối đa 40 điểm: ghép các mô-đun, chạy đầu-cuối, đánh giá RAGAS,
+  phân tích lỗi và trình bày kết quả.
+- Điểm thưởng, tối đa 10 điểm: faithfulness từ 0,85; tích hợp enrichment; báo
+  cáo độ trễ từng công đoạn. Tổng điểm được chặn ở 100.
+
+2. KIẾN TRÚC ĐÍCH
+-----------------
+
+Luồng production mong muốn:
+
+  Tài liệu
+    -> trích xuất văn bản/OCR và metadata
+    -> M1: chunking nâng cao
+    -> M5: enrichment ngoại tuyến, nếu dùng
+    -> M2: BM25 + dense retrieval + RRF
+    -> M3: cross-encoder reranking, lấy top 3
+    -> LLM sinh câu trả lời có căn cứ
+    -> M4: RAGAS + failure analysis
+    -> reports/ và analysis/
+
+Luồng baseline:
+
+  Tài liệu
+    -> chia theo đoạn văn
+    -> dense retrieval
+    -> câu trả lời cơ sở
+    -> cùng bộ test và cùng cách đánh giá
+
+Các thành phần chính:
+
+- M1 - Advanced Chunking: cung cấp basic, semantic, hierarchical và
+  structure-aware chunking. Hierarchical chunking phải tìm bằng child nhỏ nhưng
+  trả parent đủ ngữ cảnh cho bước sinh.
+- M2 - Hybrid Search: tách từ tiếng Việt, lập chỉ mục BM25, lập chỉ mục vector
+  BAAI/bge-m3 trong Qdrant và hợp nhất hai bảng hạng bằng RRF.
+- M3 - Reranking: dùng BAAI/bge-reranker-v2-m3 hoặc phương án tương thích để
+  chấm trực tiếp cặp câu hỏi - tài liệu, rồi rút top 20 về top 3; đồng thời đo
+  độ trễ.
+- M4 - Evaluation: tính faithfulness, answer relevancy, context precision và
+  context recall; lưu điểm tổng hợp, điểm từng câu và chẩn đoán nhóm câu tệ nhất.
+- M5 - Enrichment: tóm tắt, sinh câu hỏi giả định HyQA, thêm ngữ cảnh đầu đoạn
+  và trích xuất metadata. Đây là chi phí một lần khi lập chỉ mục và là phần mở
+  rộng/điểm thưởng trong pipeline nhóm.
+- Generation: ghép các context đã xếp hạng vào prompt, yêu cầu mô hình chỉ trả
+  lời từ bằng chứng và từ chối khi không đủ dữ kiện.
+
+3. VAI TRÒ CỦA CÁC TỆP VÀ THƯ MỤC
+---------------------------------
+
+- README.md: mô tả mục tiêu, cấu trúc dự kiến, thứ tự chạy và tiến độ bài lab.
+- ASSIGNMENT_INDIVIDUAL.md: đặc tả TODO, tiêu chí và bài kiểm thử của M1-M5.
+- ASSIGNMENT_GROUP.md: hướng dẫn tích hợp, đánh giá, Error Tree, deliverable và
+  nội dung thuyết trình.
+- RUBRIC.md: nguồn ưu tiên khi quyết định việc nào ảnh hưởng điểm; đặc biệt yêu
+  cầu RAGAS và failure analysis để tránh điểm liệt phần nhóm.
+- config.py: cấu hình dùng chung cho khóa API, Qdrant, model, kích thước chunk,
+  top-k và đường dẫn dữ liệu.
+- naive_baseline.py: dựng bản paragraph chunking + dense-only và ghi
+  naive_baseline_report.json.
+- src/m1_chunking.py đến src/m5_enrichment.py: mã khung cho từng mô-đun.
+- src/pipeline.py: ghép M1 -> M5 -> M2 -> M3 -> generation -> M4.
+- main.py: chạy baseline, production, chuyển báo cáo vào reports/ và in bảng
+  so sánh.
+- check_lab.py: kiểm tra một phần định dạng bài nộp, báo cáo, TODO và pytest.
+- tests/: có 37 hàm test thực tế: M1 có 13, M2 có 5, M3 có 5, M4 có 4 và M5
+  có 10. Con số này mới hơn một số ô tổng số test ghi trong mẫu báo cáo.
+- test_set.json: dữ liệu câu hỏi và ground truth dùng chung cho đánh giá.
+- data/: corpus nguồn.
+- analysis/failure_analysis.md: bảng điểm và phân tích bottom-5 bằng Error Tree.
+- analysis/group_report.md: phân công, bảng naive/production, phát hiện chính và
+  ghi chú thuyết trình.
+- analysis/reflections/: mỗi thành viên phải tạo reflection_[Tên].md riêng;
+  reflection_TEMPLATE.md chỉ là mẫu.
+- templates/: bản mẫu dự phòng của báo cáo nhóm và failure analysis.
+- reports/: nơi chứa hai JSON sinh tự động sau khi chạy.
+
+4. DỮ LIỆU VÀ ĐẦU RA HIỆN CÓ
+----------------------------
+
+Corpus hiện có hai PDF:
+
+- data/BCTC.pdf: 2 trang, khoảng 1,34 MB;
+- data/Nghi_dinh_so_13-2023_ve_bao_ve_du_lieu_ca_nhan_508ee.pdf: 39 trang,
+  khoảng 12,53 MB, là Nghị định 13/2023 về bảo vệ dữ liệu cá nhân.
+
+Các trang mẫu của cả hai PDF không trả ra ký tự khi kiểm tra lớp văn bản. Loader
+đã được mở rộng để đọc Markdown/TXT, trích xuất PDF theo trang và tự gọi
+Tesseract OCR với ngôn ngữ vie+eng khi trang không có text. Metadata nguồn,
+doc_id và số trang được giữ lại. Máy chạy cần cài Tesseract cùng language pack
+tiếng Việt hoặc cung cấp bản Markdown/TXT đã OCR cùng tên.
+
+test_set.json đã được thay bằng 20 câu hỏi UTF-8 hợp lệ, có question,
+ground_truth, source và article. Ground truth được đối chiếu với toàn văn Nghị
+định 13/2023/NĐ-CP do Cổng Thông tin điện tử Chính phủ công bố.
+
+reports/ hiện chưa có báo cáo JSON, chỉ có .gitkeep. Các tệp trong analysis/
+vẫn là biểu mẫu chưa điền.
+
+5. TRẠNG THÁI TRIỂN KHAI THỰC TẾ
+-------------------------------
+
+Kho mã đã được hoàn thiện về mặt triển khai nhưng chưa được chạy xác nhận:
+
+- M1 đọc PDF/OCR, triển khai đủ semantic, hierarchical, structure-aware và bảng
+  so sánh; parent_id có thêm doc/page để không va chạm.
+- M2 triển khai tách từ tiếng Việt, BM25, BGE-M3/Qdrant và RRF theo chunk_id.
+- M3 lazy-load FlagReranker/CrossEncoder, có lexical fallback được cảnh báo,
+  Flashrank và benchmark avg/min/max/p95.
+- M4 chạy RAGAS khi có API key, hỗ trợ heuristic ngoại tuyến có trường
+  evaluation_backend, lưu per-question và phân tích bottom-N.
+- M5 triển khai bốn kỹ thuật enrichment, giữ original_text và metadata gốc;
+  HyQA/summary được đưa vào retrieval text.
+- Pipeline giữ parent_store, truy xuất/rerank child rồi hydrate parent trước khi
+  sinh; baseline dùng cùng generator và evaluator để so sánh công bằng.
+- Có requirements.txt, docker-compose.yml, .env.example đầy đủ; báo cáo JSON
+  không còn bị .gitignore loại bỏ.
+- main.py tự tạo JSON, bảng delta, latency breakdown, group report và bottom-5
+  failure analysis sau khi người dùng chạy.
+- check_lab.py kiểm tra M5, môi trường, test set đủ 20, mọi dạng TODO và không
+  nhận reflection_TEMPLATE.md là bài cá nhân.
+
+Không nên suy ra mức hoàn thành chỉ từ mã tĩnh. Tiêu chuẩn cuối vẫn là: dependency
+cài được, OCR nạp được corpus, 37 test pass, lint sạch, Qdrant/LLM/RAGAS chạy
+thật, evaluation_backend là ragas và báo cáo có số liệu thực tế.
+
+6. KẾT QUẢ CẦN NỘP
+------------------
+
+Một bài hoàn chỉnh cần có:
+
+- mã đã triển khai trong src/ và pipeline tích hợp;
+- test_set.json hợp lệ với ít nhất 20 mẫu có căn cứ từ corpus;
+- reports/naive_baseline_report.json;
+- reports/ragas_report.json có aggregate, num_questions và failures;
+- analysis/failure_analysis.md đã phân tích bottom-5;
+- analysis/group_report.md đã điền số liệu và kết luận;
+- một analysis/reflections/reflection_[Tên].md thật cho mỗi thành viên;
+- README và môi trường cài đặt đủ để tái lập kết quả;
+- phần trình bày gồm bảng điểm, cải thiện lớn nhất, một case study Error Tree và
+  bước tối ưu tiếp theo.
+
+7. TIÊU CHUẨN THÀNH CÔNG
+-----------------------
+
+- Pipeline production chạy hết từ dữ liệu đến báo cáo mà không dùng kết quả
+  hardcode.
+- Baseline và production dùng cùng corpus, test set và điều kiện sinh/đánh giá
+  để phép so sánh có ý nghĩa.
+- Ít nhất một metric RAGAS đạt 0,75; tốt hơn là hai metric đạt 0,75 và
+  faithfulness đạt 0,85 để lấy đủ điểm/điểm thưởng tương ứng.
+- Bottom-5 có câu hỏi, expected, output, worst metric, đường đi Error Tree,
+  nguyên nhân gốc và cách sửa cụ thể.
+- Có số liệu độ trễ nếu làm bonus, tách rõ chunk/index/search/rerank/generate/eval.
+- Khóa API không được commit; báo cáo cần nộp phải thực sự được Git theo dõi.
+
+Lưu ý: chưa có pipeline hoặc test nào được chạy trong quá trình viết tài liệu
+này; các nhận định trên đến từ việc đọc tĩnh tệp, cấu trúc và dữ liệu hiện có.

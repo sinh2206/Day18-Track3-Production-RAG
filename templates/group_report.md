@@ -7,10 +7,11 @@
 
 | Tên | Module | Hoàn thành | Tests pass |
 |-----|--------|-----------|-----------|
-| | M1: Chunking | ☐ | /8 |
+| | M1: Chunking/OCR | ☐ | /13 |
 | | M2: Search | ☐ | /5 |
 | | M3: Rerank | ☐ | /5 |
 | | M4: Eval | ☐ | /4 |
+| | M5: Enrichment | ☐ | /10 |
 
 ## Kết quả
 

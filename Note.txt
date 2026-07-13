@@ -1,0 +1,478 @@
+CÁCH THỰC HIỆN DỰ ÁN LAB 18: PRODUCTION RAG
+===========================================
+
+Tài liệu này là kế hoạch thao tác và kiểm tra. Các lệnh ở cuối chỉ là lệnh đề
+nghị để người thực hiện tự chạy; chưa có lệnh pipeline, test, lint hay checker nào
+được chạy khi viết ba tệp hướng dẫn.
+
+TRẠNG THÁI SAU KHI HOÀN THIỆN MÃ
+--------------------------------
+
+- M1-M5, pipeline, baseline, RAGAS/fallback, OCR và báo cáo tự động đã được viết.
+- requirements.txt, docker-compose.yml, .env.example và test_set 20 câu đã có.
+- Không còn TODO trong src/; reports/*.json có thể được Git theo dõi.
+- Người dùng còn phải cài Tesseract/dependency, điền API key, chạy các lệnh ở mục
+  XV, kiểm tra evaluation_backend là ragas và điền tên/reflection cá nhân.
+
+I. NGUYÊN TẮC THỰC HIỆN
+-----------------------
+
+1. Sửa dữ liệu và môi trường trước khi debug thuật toán.
+2. Chốt hợp đồng dữ liệu giữa các mô-đun trước khi chia việc.
+3. Làm baseline và production trên cùng corpus, test set và điều kiện đánh giá.
+4. Mỗi thay đổi phải được xác nhận bằng test hoặc metric, không bằng một ví dụ đẹp.
+5. Giữ raw text và nguồn; enrichment không được trở thành bằng chứng thay cho tài
+   liệu gốc.
+6. Ưu tiên hạng mục bắt buộc: M1-M4, pipeline, RAGAS, failure analysis; làm M5 và
+   latency bonus sau khi luồng chính đã ổn định.
+
+II. GIAI ĐOẠN 0 - CHỐT PHẠM VI VÀ PHÂN CÔNG
+-------------------------------------------
+
+- Nếu làm theo nhóm, chỉ định chủ sở hữu M1, M2, M3, M4; người làm M1 hoặc M4 có
+  thể kiêm M5 tùy số thành viên.
+- Thống nhất mỗi mô-đun nhận/trả kiểu dữ liệu nào, tên trường metadata và cách đặt
+  chunk_id/parent_id trước khi viết mã.
+- Dùng một nhánh tích hợp sớm; không đợi tất cả mô-đun hoàn hảo mới ghép.
+- Ghi ngay tên người, mô-đun và hàm phụ trách vào bản reflection cá nhân để cuối
+  bài không thiếu bằng chứng đóng góp.
+
+Hợp đồng dữ liệu nên có tối thiểu:
+
+- Chunk: chunk_id, raw_text, retrieval_text, metadata, parent_id nếu có.
+- Metadata: doc_id, source, title, page/section nếu trích xuất được.
+- SearchResult: text hoặc chunk_id, score, metadata, method.
+- RerankResult: original_score, rerank_score, rank và metadata nguyên vẹn.
+- Eval item: question, answer, contexts, ground_truth và bốn metric.
+
+III. GIAI ĐOẠN 1 - KHÔI PHỤC MÔI TRƯỜNG CÓ THỂ TÁI LẬP
+------------------------------------------------------
+
+1. Chọn Python 3.10 trở lên và tạo môi trường ảo.
+2. Dùng requirements.txt đã được bổ sung với phiên bản được pin. Các nhóm
+   dependency gồm:
+
+   - python-dotenv;
+   - công cụ PDF/OCR;
+   - underthesea và rank-bm25;
+   - sentence-transformers, FlagEmbedding hoặc reranker đã chọn;
+   - qdrant-client;
+   - ragas, datasets và OpenAI client;
+   - pytest và ruff;
+   - flashrank nếu dùng phương án rerank nhẹ.
+
+3. Chọn và pin một phiên bản RAGAS, rồi làm mã theo đúng schema/API của phiên bản
+   đó. Không trộn ví dụ của nhiều phiên bản.
+4. Sao chép .env.example thành .env và thay khóa giả bằng khóa thật. Không commit
+   .env, không in khóa trong log.
+5. Khởi động Qdrant tại localhost:6333. Vì docker-compose.yml hiện không có,
+   hoặc bổ sung compose tái lập được, hoặc ghi rõ cách chạy Qdrant thay thế.
+6. Kiểm tra model embedding trả đúng 1024 chiều như config.py; nếu đổi model thì
+   cập nhật đồng bộ EMBEDDING_DIM và collection.
+
+Điều kiện qua giai đoạn: Python nhập được dependency, Qdrant phản hồi, .env được
+đọc, nhưng chưa cần chạy toàn pipeline.
+
+IV. GIAI ĐOẠN 2 - CHUẨN BỊ CORPUS
+---------------------------------
+
+Hai PDF nguồn không có lớp text đọc được trực tiếp. load_documents() đã hỗ trợ
+PDF theo trang và tự OCR bằng Tesseract; vẫn có thể dùng một trong hai cách sau.
+
+Cách ngắn gọn phù hợp bài lab:
+
+1. OCR hai PDF bằng công cụ có hỗ trợ tiếng Việt.
+2. Xuất thành Markdown UTF-8, một tệp cho mỗi tài liệu hoặc một tệp theo từng
+   phần lớn.
+3. Chèn marker trang và chuyển tiêu đề/chương/điều/khoản thành heading Markdown.
+4. Đặt tệp kết quả trong data/; loader ưu tiên Markdown/TXT cùng tên để tránh OCR
+   lại và tránh nạp trùng PDF.
+
+Cách production hơn:
+
+1. Mở rộng loader để nhận PDF, nhận biết trang có text hay ảnh và gọi OCR khi
+   cần.
+2. Trả từng page/section cùng metadata thay vì một chuỗi duy nhất.
+3. Cache kết quả OCR theo hash tệp để không trả phí/lặp lại công việc.
+
+Với cả hai cách, cần kiểm tra:
+
+- văn bản tiếng Việt không mất dấu và ở Unicode NFC;
+- số điều, khoản, ngày, phần trăm, đơn vị và số liệu bảng không bị OCR sai;
+- thứ tự đọc đúng, không trộn đầu trang/chân trang vào nội dung;
+- source, page, section và doc_id không bị mất;
+- load_documents() trả số tài liệu lớn hơn 0;
+- có ít nhất một mẫu kiểm tra thủ công ở trang đầu, giữa và cuối mỗi PDF.
+
+Không tiếp tục lập chỉ mục nếu corpus vẫn rỗng. Test hiện tại có nhánh bỏ qua khi
+load_documents() rỗng nên test pass không bảo vệ được lỗi này.
+
+V. GIAI ĐOẠN 3 - TẠO TEST SET THẬT
+----------------------------------
+
+test_set.json đã được thay bằng 20 câu từ Nghị định 13/2023/NĐ-CP. Khi thay đổi
+corpus, dùng lại quy trình sau để rà soát hoặc mở rộng bộ đánh giá.
+
+Quy trình đề nghị:
+
+1. Sau khi OCR, chọn evidence rõ ràng từ cả hai tài liệu.
+2. Tạo tối thiểu 20 cặp question/ground_truth, đúng JSON và UTF-8.
+3. Mỗi ground_truth phải được tài liệu hỗ trợ, không dựa vào kiến thức ngoài.
+4. Bao phủ các nhóm:
+
+   - câu hỏi trực tiếp theo từ khóa;
+   - câu hỏi diễn đạt đồng nghĩa để kiểm tra dense retrieval;
+   - câu hỏi có số liệu, ngày, điều/khoản để kiểm tra BM25;
+   - câu cần phân biệt hai phần gần giống nhau;
+   - câu cần tổng hợp hai đoạn nếu corpus cho phép;
+   - một số câu không đủ thông tin để kiểm tra khả năng từ chối.
+
+5. Nếu có thể, thêm source/page/evidence mong đợi để failure analysis nhanh hơn;
+   loader M4 hiện chỉ bắt buộc question và ground_truth nên trường phụ không làm
+   thay đổi hợp đồng chính.
+6. Tách các câu dùng để tinh chỉnh với các câu dùng để báo cáo cuối nhằm hạn chế
+   rò rỉ test.
+7. Kiểm tra không có dấu phẩy sau phần tử cuối, không trùng câu và đủ 20 mẫu.
+
+VI. GIAI ĐOẠN 4 - TRIỂN KHAI M1: CHUNKING
+-----------------------------------------
+
+1. chunk_semantic()
+
+- Làm sạch và tách câu nhưng vẫn giữ dấu câu/heading cần thiết.
+- Xử lý riêng text rỗng và text chỉ có một câu.
+- Encode tất cả câu theo batch bằng model phù hợp tiếng Việt.
+- Tính cosine similarity của các câu liền kề; thấp hơn threshold thì kết thúc
+  nhóm hiện tại.
+- Luôn thêm nhóm cuối; đánh chunk_index, strategy và metadata nguồn.
+- Thêm giới hạn độ dài tối đa để một chủ đề dài không thành một chunk khổng lồ.
+- Không nạp lại model trong mỗi lời gọi; cache model ở cấp mô-đun hoặc truyền vào.
+
+2. chunk_hierarchical()
+
+- Gom paragraph thành parent không vượt parent_size nếu có thể.
+- Tạo parent_id dạng doc_id + chỉ số để không trùng giữa hai tài liệu.
+- Chia từng parent thành child theo ranh giới câu/đoạn; chỉ dùng sliding window ký
+  tự khi không còn cấu trúc tốt hơn.
+- Mỗi child phải nhỏ hơn parent, có parent_id hợp lệ và metadata chunk_type.
+- Trả cả parents và children; pipeline phải giữ map parent_id -> parent.
+
+3. chunk_structure_aware()
+
+- Tách bằng heading Markdown từ cấp 1 đến cấp 3 theo yêu cầu test.
+- Ghép heading với nội dung ngay sau nó, kể cả phần mở đầu trước heading đầu tiên.
+- Không cắt bảng, danh sách hoặc code block giữa chừng.
+- Lưu section sạch trong metadata và giữ heading trong text.
+
+4. compare_strategies()
+
+- Chạy đủ basic, semantic, hierarchical và structure trên mọi tài liệu.
+- Báo num_chunks, avg_length, min_length, max_length.
+- Với hierarchical, báo riêng số parent/child và thống nhất loại chunk dùng để
+  tính chiều dài.
+- Không trả dict rỗng khi một tài liệu lỗi; ghi lỗi theo source để điều tra.
+
+Điều kiện qua M1: 13 test M1 pass, corpus thật sinh chunk không rỗng, parent-child
+tra cứu được và bảng so sánh có số liệu hợp lý.
+
+VII. GIAI ĐOẠN 5 - TRIỂN KHAI M2: HYBRID SEARCH
+-----------------------------------------------
+
+1. segment_vietnamese()
+
+- Chuẩn hóa Unicode/whitespace và gọi underthesea.word_tokenize với format text.
+- Dùng cùng hàm cho corpus và query.
+- Có fallback minh bạch nếu thư viện lỗi, nhưng vẫn trả string hợp lệ.
+
+2. BM25Search
+
+- index(): lưu documents, tách từ từng chunk, tạo BM25Okapi; xử lý corpus rỗng.
+- search(): tách query, lấy score, sắp giảm dần, giới hạn top_k và trả method là
+  bm25 cùng metadata gốc.
+- Kiểm tra riêng các truy vấn có số hiệu, ngày và cụm từ pháp lý.
+
+3. DenseSearch
+
+- Lazy-load BAAI/bge-m3 một lần.
+- Tạo collection với cosine và đúng 1024 chiều; tách collection baseline với
+  production.
+- Encode theo batch, dùng chunk_id ổn định làm id Qdrant và upsert payload gồm
+  raw text/retrieval text cùng metadata.
+- Khi search, encode query theo cùng model; dùng API đúng với phiên bản
+  qdrant-client đã pin và chuyển hit về SearchResult.
+- Xác nhận số point bằng số chunk và không đưa vector NaN/rỗng vào collection.
+
+4. reciprocal_rank_fusion()
+
+- Duyệt từng bảng hạng với rank bắt đầu từ 1.
+- Cộng 1/(k + rank) theo chunk_id; chỉ dùng text làm khóa nếu chắc chắn không có
+  hai chunk trùng nội dung.
+- Sắp score RRF giảm dần, trả top_k với method hybrid và metadata nguyên vẹn.
+- Quy định tie-break ổn định để kết quả tái lập.
+
+Điều kiện qua M2: 5 test M2 pass, BM25 và dense đều trả kết quả thật, hybrid có
+kết quả từ cả hai nhánh và truy vấn mẫu lấy được evidence đúng.
+
+VIII. GIAI ĐOẠN 6 - TRIỂN KHAI M3: RERANKING
+--------------------------------------------
+
+1. Chọn FlagReranker hoặc sentence-transformers CrossEncoder và chỉ giữ một API
+   nội bộ thống nhất.
+2. _load_model() lazy-load một lần; chỉ bật FP16 khi phần cứng hỗ trợ.
+3. rerank():
+
+- trả rỗng ngay nếu documents rỗng;
+- tạo các cặp query - document;
+- chuẩn hóa score model thành danh sách số thực, kể cả trường hợp chỉ một cặp;
+- ghép score với document, sắp giảm dần và lấy top_k;
+- đánh rank nhất quán, giữ original_score và metadata.
+
+4. benchmark_reranker():
+
+- warm-up một lượt ngoài phần đo;
+- chạy n_runs bằng time.perf_counter();
+- trả avg_ms, min_ms, max_ms và nên thêm p95_ms khi làm báo cáo bonus;
+- báo cold-start riêng vì tải model không phải latency của mọi query.
+
+5. Flashrank chỉ làm sau khi cross-encoder chính hoạt động; so sánh cả độ chính
+   xác top-k lẫn tốc độ.
+
+Điều kiện qua M3: 5 test M3 pass, tài liệu liên quan đứng đầu và benchmark là số
+đo thật, không phải giá trị 0 hardcode.
+
+IX. GIAI ĐOẠN 7 - TRIỂN KHAI M4: RAGAS VÀ FAILURE ANALYSIS
+---------------------------------------------------------
+
+1. load_test_set()
+
+- Kiểm tra JSON hợp lệ, danh sách không rỗng và mỗi item có hai khóa bắt buộc.
+- Báo lỗi kèm vị trí/tệp rõ ràng thay vì tiếp tục với dữ liệu sai.
+
+2. evaluate_ragas()
+
+- Xác nhận bốn list đầu vào cùng độ dài và context có kiểu list chuỗi.
+- Chuyển dữ liệu sang schema của phiên bản RAGAS đã pin.
+- Chạy đủ faithfulness, answer relevancy, context precision, context recall.
+- Chuyển kết quả từng hàng thành EvalResult và aggregate thành float JSON được.
+- Xử lý NaN/lỗi riêng từng câu; không biến lỗi evaluator thành điểm 0 mà không
+  cảnh báo.
+
+3. failure_analysis()
+
+- Tính trung bình bốn metric từng câu, sắp tăng dần và chọn bottom-N.
+- Xác định worst_metric theo score nhỏ nhất, rồi ánh xạ threshold/diagnosis/fix.
+- Lưu question, answer, ground_truth, contexts hoặc evidence cần thiết, score,
+  diagnosis và suggested_fix để báo cáo có thể kiểm chứng.
+- Ưu tiên root cause theo Error Tree; không kết luận prompt nếu context đã thiếu.
+
+4. save_report()
+
+- Bảo đảm báo cáo có aggregate, num_questions, failures và không chứa dataclass
+  chưa chuyển đổi.
+- Ghi UTF-8 với ensure_ascii=False.
+- Kiểm tra num_questions đúng 20 hoặc đúng kích thước test set cuối.
+
+Điều kiện qua M4: 4 test M4 pass, metric đến từ RAGAS thật, per-question không
+rỗng và báo cáo JSON đọc lại được. Đây là phần bắt buộc để tránh điểm liệt nhóm.
+
+X. GIAI ĐOẠN 8 - TRIỂN KHAI M5: ENRICHMENT
+------------------------------------------
+
+M5 làm sau luồng bắt buộc để tránh API/chi phí che lỗi retrieval cơ bản.
+
+1. summarize_chunk(): dùng LLM hoặc extractive fallback; không làm mất con số và
+   điều kiện quan trọng.
+2. generate_hypothesis_questions(): sinh đúng n câu, làm sạch đánh số, bảo đảm là
+   câu hỏi và cache theo chunk.
+3. contextual_prepend(): thêm một câu source/section/topic trước raw text và luôn
+   giữ nguyên raw text trong output.
+4. extract_metadata(): yêu cầu JSON có schema, parse an toàn, validate topic,
+   entities, category, language; metadata gốc phải có ưu tiên với source/id.
+5. enrich_chunks(): xử lý từng method, tạo EnrichedChunk cho mọi input và không
+   trả cả danh sách rỗng chỉ vì một API lỗi.
+
+Phải quyết định rõ nội dung nào được index:
+
+- retrieval_text có thể gồm contextual text + câu hỏi HyQA + summary;
+- raw_text/parent text mới là bằng chứng đưa vào LLM;
+- hypothesis_questions và summary đã được ghép vào enriched_text; raw_text/parent
+  vẫn là bằng chứng đưa cho bước sinh.
+
+Thêm cache, retry có giới hạn, log chi phí và fallback. Điều kiện qua M5: 10 test
+M5 pass, original_text được bảo toàn và kết quả enrichment thực sự được index.
+
+XI. GIAI ĐOẠN 9 - GHÉP PIPELINE ĐẦU-CUỐI
+----------------------------------------
+
+Thứ tự ghép:
+
+1. Nạp tài liệu đã OCR.
+2. M1 tạo parents/children; giữ parent_store và lập chỉ mục children.
+3. M5 tạo retrieval_text nhưng không làm mất chunk_id/parent_id/source.
+4. M2 lập hai chỉ mục và trả top 20 hybrid.
+5. M3 rerank top 20 xuống top 3.
+6. Với mỗi child top 3, hydrate parent qua parent_id, loại parent trùng và dùng
+   parent/raw text làm context.
+7. LLM sinh câu trả lời từ context; nếu không đủ bằng chứng thì trả "Không tìm
+   thấy thông tin".
+8. M4 đánh giá và lưu report.
+
+Các điểm phải sửa trong pipeline khung:
+
+- Giữ parent_store; hiện pipeline bỏ parents sau khi chunk.
+- Hoàn thiện generation; hiện answer chỉ bằng context đầu tiên.
+- Quyết định cách dùng HyQA/summary trong retrieval_text.
+- Thêm kiểm tra sớm khi docs/chunks rỗng thay vì tiếp tục tới Qdrant.
+- Bảo toàn metadata qua enrichment, Qdrant, RRF và rerank.
+- Đo riêng thời gian load/OCR/chunk/enrich/index và search/rerank/generate/eval.
+- Fallback phải ghi cảnh báo và tên tầng bị fallback để failure analysis không
+  hiểu sai kết quả.
+
+XII. GIAI ĐOẠN 10 - BASELINE VÀ SO SÁNH CÔNG BẰNG
+-------------------------------------------------
+
+naive_baseline.py đã dùng DenseSearch, generator và evaluator chung với production.
+Người dùng vẫn nên chạy test M2/M4 trước khi tạo baseline để lỗi hạ tầng được phát
+hiện sớm.
+
+Baseline chính thức:
+
+- basic paragraph chunking;
+- dense-only retrieval;
+- không hybrid, rerank hoặc enrichment;
+- collection lab18_naive;
+- cùng test set production.
+
+Để delta phản ánh retrieval, nên dùng cùng generator/prompt cho cả hai nhánh.
+Nếu phải giữ fallback lấy context đầu theo scaffold, ghi rõ giới hạn này trong
+group report và có thể bổ sung một bảng ablation dùng generator giống nhau.
+
+Không dùng lại collection sai, không đổi test set giữa hai lần và không so điểm
+từ hai phiên bản RAGAS khác nhau. Lưu tham số và thời điểm chạy cùng báo cáo.
+
+XIII. GIAI ĐOẠN 11 - ĐÁNH GIÁ, SỬA LỖI VÀ ABLATION
+-------------------------------------------------
+
+1. Chạy production trên toàn bộ test set và lưu bốn metric aggregate cùng điểm
+   từng câu.
+2. So sánh naive với production và tính delta theo đúng cùng metric.
+3. Chọn bottom-5 theo điểm trung bình hoặc quy tắc đã công bố.
+4. Với từng câu, đi Error Tree:
+
+   - output đúng hay sai;
+   - context có đúng evidence không;
+   - nếu thiếu context: kiểm tra OCR -> chunk -> BM25/dense -> RRF -> rerank;
+   - nếu context đúng: kiểm tra parent hydration -> prompt -> generation;
+   - ghi root cause cụ thể và một fix có thể đo.
+
+5. Sửa một tầng mỗi lần rồi chạy lại cùng câu và toàn test set để tránh cải thiện
+   cục bộ nhưng làm giảm metric khác.
+6. Nếu có thời gian, làm ablation:
+
+   - dense-only;
+   - BM25 + dense;
+   - hybrid + rerank;
+   - hybrid + rerank + enrichment.
+
+Ablation giúp trả lời chính xác "mô-đun nào tạo cải thiện lớn nhất" trong phần
+trình bày.
+
+XIV. GIAI ĐOẠN 12 - HOÀN THIỆN BÁO CÁO
+--------------------------------------
+
+analysis/failure_analysis.md:
+
+- điền bảng naive/production/delta;
+- điền đủ 5 failure, không để dòng "copy template";
+- mỗi failure có expected, got, worst metric, Error Tree, root cause, fix;
+- chọn một case study đủ evidence cho presentation.
+
+analysis/group_report.md:
+
+- cập nhật tên, phân công và số test thực tế;
+- điền bốn metric và delta;
+- nêu biggest improvement, challenge, surprise finding bằng số liệu;
+- chuẩn bị đủ bốn ý thuyết trình theo rubric.
+
+analysis/reflections/:
+
+- sao chép mẫu thành reflection_[Tên].md cho từng người;
+- ghi module, hàm đã làm, số test, kiến thức, khó khăn và tự đánh giá;
+- không coi reflection_TEMPLATE.md là bài cá nhân dù checker hiện có thể nhận nó.
+
+reports/:
+
+- phải có ragas_report.json và naive_baseline_report.json hợp lệ;
+- .gitignore hiện bỏ qua reports/*.json, nên trước khi nộp phải sửa quy tắc ignore
+  hoặc chủ động thêm các báo cáo cần nộp vào Git;
+- dùng git status và danh sách tệp được theo dõi để xác nhận, không chỉ nhìn thấy
+  tệp trên máy.
+
+XV. THỨ TỰ LỆNH ĐỀ NGHỊ ĐỂ NGƯỜI THỰC HIỆN TỰ CHẠY
+--------------------------------------------------
+
+Sau khi đã cài môi trường, chuẩn bị dữ liệu và triển khai mã:
+
+1. Kiểm thử từng mô-đun:
+
+   python -m pytest tests/test_m1.py -v
+   python -m pytest tests/test_m2.py -v
+   python -m pytest tests/test_m3.py -v
+   python -m pytest tests/test_m4.py -v
+   python -m pytest tests/test_m5.py -v
+
+2. Kiểm thử chung và kiểm tra tĩnh:
+
+   python -m pytest tests/ -v
+   ruff check src/
+   rg -n "TODO" src
+
+3. Kiểm tra riêng luồng dữ liệu trước khi chạy tốn tài nguyên:
+
+- số document lớn hơn 0;
+- số parent/child lớn hơn 0;
+- test_set đọc được và đủ mẫu;
+- Qdrant sẵn sàng;
+- khóa API/model evaluator sẵn sàng.
+
+4. Tạo kết quả:
+
+   python naive_baseline.py
+   python src/pipeline.py
+
+Hoặc dùng lệnh tổng hợp sau khi hai luồng riêng đã ổn định:
+
+   python main.py
+
+Lưu ý main.py tự chạy lại cả baseline lẫn production, sau đó chuyển hai JSON vào
+reports/; không cần chạy lặp nếu không muốn phát sinh thêm thời gian/chi phí.
+
+5. Sau khi điền analysis và reflection:
+
+   python check_lab.py
+   git status --short
+
+check_lab.py chỉ là lớp kiểm tra cuối, không thay thế code review. Checker đã được
+cập nhật để đếm mọi TODO trong src/, kiểm tra test set đủ 20 và loại
+reflection_TEMPLATE.md khỏi danh sách bài cá nhân.
+
+XVI. CHECKLIST TRƯỚC KHI NỘP
+----------------------------
+
+[ ] Có requirements.txt được pin và cách khởi động Qdrant tái lập được.
+[ ] Hai PDF đã được OCR/trích xuất; loader nạp được dữ liệu thật.
+[ ] test_set.json là JSON hợp lệ, có ít nhất 20 câu có ground truth đúng.
+[ ] Không còn bất kỳ dòng TODO nào trong src/.
+[ ] 37 test hiện có pass và ruff không báo lỗi.
+[ ] Dense, hybrid, rerank, generation và RAGAS đều chạy thật, không còn fallback
+    rỗng/điểm 0 hardcode.
+[ ] Hierarchical retrieval lấy lại parent, không chỉ trả child.
+[ ] Baseline và production dùng điều kiện so sánh giống nhau.
+[ ] reports/ragas_report.json có aggregate, num_questions, failures.
+[ ] Có báo cáo baseline và bảng delta bốn metric.
+[ ] failure_analysis có bottom-5, diagnosis, fix và Error Tree walkthrough.
+[ ] group_report và reflection_[Tên].md đã điền đầy đủ.
+[ ] Ít nhất một metric đạt 0,75; kiểm tra mục tiêu bonus nếu có.
+[ ] Báo cáo JSON không bị bỏ quên vì .gitignore và thực sự có trong bài nộp.
+[ ] Không có .env, khóa API, dữ liệu nhạy cảm hoặc log bí mật trong Git.
+[ ] Người khác có thể làm theo README/môi trường đã bổ sung để tái lập kết quả.

@@ -49,3 +49,6 @@
 
 **Nếu có thêm 1 giờ, sẽ optimize:**
 -
+
+> `python main.py` sẽ thay nội dung tệp này bằng bottom-5 và Error Tree từ kết
+> quả thật. Nhóm cần đọc lại context, xác nhận root cause và bổ sung nhận xét.

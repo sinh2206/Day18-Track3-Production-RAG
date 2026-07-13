@@ -1,105 +1,97 @@
 # Lab 18: Production RAG Pipeline
 
-**AICB-P2T3 · Ngày 18 · Production RAG**  
-**Giảng viên:** M.Sc Trần Minh Tú · **Thời gian:** 2 giờ
+Pipeline RAG tiếng Việt hoàn chỉnh:
 
----
-
-## Tổng quan
-
-Lab gồm **2 phần**:
-
-| Phần | Hình thức | Thời gian | Mô tả |
-|------|-----------|-----------|-------|
-| **Phần A** | Cá nhân | 1.5 giờ | Implement 1 trong 4 modules |
-| **Phần B** | Nhóm (3–4 người) | 30 phút | Ghép modules → full pipeline → eval → present |
-
-```
-  Cá nhân                         Nhóm
-  ┌────────────┐
-  │ M1 Chunking│──┐
-  ├────────────┤  │    ┌──────────────────────────────┐
-  │ M2 Search  │──┼───▶│  Production RAG System        │
-  ├────────────┤  │    │  pipeline.py + RAGAS eval     │
-  │ M3 Rerank  │──┤    │  + failure analysis           │
-  ├────────────┤  │    └──────────────────────────────┘
-  │ M4 Eval    │──┘
-  └────────────┘
+```text
+PDF/Markdown/TXT
+  -> trích xuất văn bản hoặc OCR
+  -> hierarchical chunking (child retrieve, parent context)
+  -> enrichment tùy chọn
+  -> BM25 + BGE-M3/Qdrant + RRF
+  -> BGE reranker
+  -> LLM generation
+  -> RAGAS + failure analysis + latency report
 ```
 
-## Quick Start
+## Thành phần
 
-```bash
-git clone <repo-url> && cd lab18-production-rag
-docker compose up -d                    # Qdrant
+- `src/m1_chunking.py`: đọc PDF theo trang, OCR fallback, basic/semantic/
+  hierarchical/structure-aware chunking.
+- `src/m2_search.py`: tách từ tiếng Việt, BM25, dense retrieval và RRF.
+- `src/m3_rerank.py`: FlagEmbedding/CrossEncoder, Flashrank và benchmark.
+- `src/m4_eval.py`: RAGAS, heuristic offline có gắn nhãn, bottom-N diagnosis.
+- `src/m5_enrichment.py`: summary, HyQA, contextual prepend, auto metadata.
+- `src/pipeline.py`: tích hợp M1-M5, hydrate parent và sinh câu trả lời.
+- `naive_baseline.py`: paragraph + dense-only, dùng cùng generator/evaluator.
+- `main.py`: chạy hai pipeline, so sánh và sinh báo cáo trong `reports/`,
+  `analysis/`.
+- `test_set.json`: 20 câu hỏi có ground truth từ Nghị định 13/2023/NĐ-CP.
+
+Nguồn đối chiếu test set: [toàn văn do Cổng Thông tin điện tử Chính phủ công
+bố](https://xaydungchinhsach.chinhphu.vn/toan-van-nghi-dinh-13-2023-nd-cp-bao-ve-du-lieu-ca-nhan-119230516104357809.htm).
+
+## Chuẩn bị
+
+Yêu cầu Python 3.10+, Docker và Tesseract OCR có gói ngôn ngữ Việt (`vie`).
+PDF trong `data/` là PDF ảnh nên Tesseract là bắt buộc nếu chưa có bản Markdown
+hoặc TXT cùng tên.
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
 pip install -r requirements.txt
-cp .env.example .env                    # Điền API keys
-python naive_baseline.py                # ⚠️ Chạy TRƯỚC để có baseline
+Copy-Item .env.example .env
+docker compose up -d
 ```
 
-## Chạy toàn bộ
+Điền `OPENAI_API_KEY` trong `.env` để dùng LLM và RAGAS thật. Đặt
+`RAGAS_STRICT=true` để không chấp nhận evaluator fallback trong lần chạy chấm
+điểm. Bật `ENABLE_ENRICHMENT=true` khi muốn chạy phần bonus; mặc định tắt để
+tránh phát sinh nhiều API call khi kiểm tra luồng chính.
 
-```bash
-python main.py                          # Naive + Production + So sánh
-python check_lab.py                     # Kiểm tra trước khi nộp
+Nếu Tesseract không nằm trong `PATH`, điền đường dẫn executable vào
+`TESSERACT_CMD`. `OCR_LANG=vie+eng` yêu cầu cả hai language pack tương ứng.
+
+## Thứ tự người học tự chạy
+
+```powershell
+python -m pytest tests/test_m1.py -v
+python -m pytest tests/test_m2.py -v
+python -m pytest tests/test_m3.py -v
+python -m pytest tests/test_m4.py -v
+python -m pytest tests/test_m5.py -v
+ruff check src/
+rg -n "TODO" src
+python main.py
+python check_lab.py
 ```
 
-## Cấu trúc repo
+`main.py` chạy baseline rồi production, chuyển hai JSON vào `reports/`, tự điền
+số liệu và bottom-5 vào `analysis/group_report.md` và
+`analysis/failure_analysis.md`. Sau đó người học cần điền tên nhóm, nhận xét và
+tạo `analysis/reflections/reflection_[Tên].md` từ template.
 
-```
-lab18-production-rag/
-├── README.md                   # File này
-├── ASSIGNMENT_INDIVIDUAL.md    # ★ Đề bài cá nhân (Phần A)
-├── ASSIGNMENT_GROUP.md         # ★ Đề bài nhóm (Phần B)
-├── RUBRIC.md                   # Hệ thống chấm điểm chi tiết
-│
-├── main.py                     # Entry point: chạy toàn bộ pipeline
-├── check_lab.py                # Kiểm tra định dạng trước khi nộp
-├── naive_baseline.py           # Baseline (chạy trước)
-├── config.py                   # Shared config
-├── requirements.txt            # Dependencies (pinned)
-├── docker-compose.yml          # Qdrant local
-├── .env.example                # API keys template
-│
-├── data/                       # Sample corpus tiếng Việt
-│   ├── sample_01.md
-│   ├── sample_02.md
-│   └── sample_03.md
-├── test_set.json               # 20 Q&A pairs
-│
-├── src/                        # ★ Scaffold code (có TODO markers)
-│   ├── m1_chunking.py          # Module 1: Chunking
-│   ├── m2_search.py            # Module 2: Hybrid Search
-│   ├── m3_rerank.py            # Module 3: Reranking
-│   ├── m4_eval.py              # Module 4: Evaluation
-│   └── pipeline.py             # Ghép nhóm
-│
-├── tests/                      # Auto-grading
-│   ├── test_m1.py
-│   ├── test_m2.py
-│   ├── test_m3.py
-│   └── test_m4.py
-│
-├── analysis/                   # ★ Deliverable
-│   ├── failure_analysis.md     # Phân tích failures (nhóm)
-│   ├── group_report.md         # Báo cáo nhóm
-│   └── reflections/            # Reflection cá nhân
-│       └── reflection_TEMPLATE.md
-│
-├── reports/                    # ★ Auto-generated (sau khi chạy main.py)
-│   ├── ragas_report.json
-│   └── naive_baseline_report.json
-│
-└── templates/                  # Templates gốc (backup)
-    ├── failure_analysis.md
-    └── group_report.md
+## Đầu ra
+
+```text
+reports/
+  naive_baseline_report.json
+  ragas_report.json
+analysis/
+  group_report.md
+  failure_analysis.md
+  reflections/reflection_[Tên].md
 ```
 
-## Timeline
+Mục tiêu rubric: pipeline exit code 0, có RAGAS thật, ít nhất một metric đạt
+0,75, bottom-5 có diagnosis/fix/Error Tree; bonus cho faithfulness từ 0,85,
+enrichment và latency breakdown.
 
-| Thời gian | Hoạt động |
-|-----------|-----------|
-| 0:00–0:15 | Setup + chạy `naive_baseline.py` |
-| 0:15–1:45 | **Phần A (cá nhân):** implement module → `pytest tests/test_m*.py` |
-| 1:45–2:15 | **Phần B (nhóm):** ghép → `python src/pipeline.py` → failure analysis |
-| 2:15–2:30 | Presentation 5 phút/nhóm |
+## Lưu ý đánh giá
+
+- `evaluation_backend` trong JSON phải là `ragas` cho lần nộp chính thức.
+- Baseline và production dùng cùng test set, generator và evaluator để delta có
+  ý nghĩa.
+- Không commit `.env`; hai báo cáo JSON không còn bị `.gitignore` loại bỏ.
+- Chưa có lệnh nào được chạy trong lần hoàn thiện mã này; người học chịu trách
+  nhiệm chạy, kiểm tra số liệu và điền phần thông tin cá nhân.

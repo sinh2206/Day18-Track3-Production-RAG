@@ -7,10 +7,11 @@
 
 | Tên | Module | Hoàn thành | Tests pass |
 |-----|--------|-----------|-----------|
-| | M1: Chunking | ☐ | /8 |
+| | M1: Chunking/OCR | ☐ | /13 |
 | | M2: Hybrid Search | ☐ | /5 |
 | | M3: Reranking | ☐ | /5 |
 | | M4: Evaluation | ☐ | /4 |
+| | M5: Enrichment | ☐ | /10 |
 
 ## Kết quả RAGAS
 
@@ -33,3 +34,6 @@
 2. Biggest win — module nào, tại sao:
 3. Case study — 1 failure, Error Tree walkthrough:
 4. Next optimization nếu có thêm 1 giờ:
+
+> `python main.py` sẽ tự điền bảng điểm, latency, biggest improvement và tạo
+> bottom-5 trong `failure_analysis.md`. Nhóm vẫn cần điền tên và nhận xét.

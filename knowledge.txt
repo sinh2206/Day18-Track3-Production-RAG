@@ -1,0 +1,256 @@
+KIẾN THỨC CẦN CÓ CHO LAB PRODUCTION RAG
+=======================================
+
+1. TƯ DUY HỆ THỐNG RAG
+----------------------
+
+RAG gồm hai pha khác nhau:
+
+- Pha lập chỉ mục, thường chạy ngoại tuyến: nạp tài liệu, OCR/làm sạch, chia
+  chunk, enrichment, embedding và ghi vào chỉ mục.
+- Pha truy vấn, chạy trực tuyến: xử lý câu hỏi, retrieve, fusion, rerank, lấy
+  context, sinh câu trả lời và ghi nhận độ trễ.
+
+Chất lượng cuối là tích của nhiều tầng. Câu trả lời sai không mặc nhiên là lỗi
+LLM: dữ liệu có thể chưa được đọc, chunk có thể mất ý, search có thể bỏ sót,
+reranker có thể xếp sai hoặc prompt có thể cho phép suy diễn ngoài bằng chứng.
+
+Một pipeline production còn cần tính tái lập, quan sát được, xử lý lỗi, bảo mật
+khóa API và báo cáo định lượng; không chỉ cần một ví dụ demo trả lời đúng.
+
+2. NẠP VÀ LÀM SẠCH TÀI LIỆU PDF TIẾNG VIỆT
+------------------------------------------
+
+Cần phân biệt PDF có lớp văn bản với PDF ảnh/scan. Với PDF scan, thư viện đọc
+PDF thông thường có thể trả chuỗi rỗng; phải OCR từng trang trước khi chunk.
+
+Các việc cần hiểu:
+
+- OCR tiếng Việt phải dùng model/ngôn ngữ có dấu; kiểm tra lỗi nhầm 0/O, 1/l,
+  mất dấu, ghép từ và ký hiệu điều/khoản.
+- Giữ ranh giới trang, tiêu đề, điều, khoản, mục, bảng và chú thích thay vì nối
+  toàn bộ thành một chuỗi.
+- Chuẩn hóa Unicode về NFC, khoảng trắng và xuống dòng; không bỏ dấu tiếng Việt.
+- Gắn metadata ổn định: doc_id, source, title, page, section, chunk_id và phiên
+  bản/ngày văn bản nếu có.
+- Lưu raw text để đối chiếu và citation; text đã làm sạch hoặc enrichment chỉ là
+  biểu diễn phục vụ tìm kiếm.
+- Kiểm tra thủ công một số trang đầu, giữa, cuối trước khi tin toàn bộ OCR.
+
+Với văn bản pháp luật, số điều/khoản, tên cơ quan, mốc ngày và cụm từ nguyên văn
+rất quan trọng. Với báo cáo có bảng, cần bảo toàn quan hệ hàng - cột; OCR thành
+các dòng rời có thể làm sai nghĩa số liệu.
+
+3. CHUNKING
+-----------
+
+3.1. Basic chunking
+
+Chia theo đoạn văn hoặc độ dài cố định. Cách này nhanh và dùng làm baseline,
+nhưng có thể cắt giữa một ý hoặc trộn nhiều chủ đề.
+
+3.2. Semantic chunking
+
+- Tách tài liệu thành câu.
+- Biến mỗi câu thành vector embedding.
+- Tính cosine similarity giữa các câu hoặc nhóm câu liền kề.
+- Khi similarity thấp hơn threshold thì mở chunk mới.
+
+Cosine similarity gần 1 nghĩa là hướng vector gần nhau. Threshold quá cao tạo
+nhiều chunk vụn; quá thấp tạo chunk dài và pha tạp. Phải kiểm soát cả kích thước
+tối đa, trường hợp văn bản rỗng, một câu duy nhất và model không tải được.
+
+3.3. Hierarchical chunking
+
+- Parent lớn giữ ngữ cảnh đầy đủ.
+- Child nhỏ tạo embedding chính xác hơn.
+- Lập chỉ mục child; khi child được tìm thấy, dùng parent_id để lấy parent.
+
+parent_id phải duy nhất toàn corpus, không chỉ duy nhất trong một tài liệu. Cần
+lưu parent trong một kho tra cứu; chỉ gắn parent_id vào child mà không giữ parent
+thì chưa phải hierarchical retrieval hoàn chỉnh.
+
+3.4. Structure-aware chunking
+
+Chia theo cấu trúc logic như tiêu đề Markdown, chương, mục, điều hoặc khoản. Nó
+phù hợp với tài liệu kỹ thuật và pháp luật vì bảo toàn bảng, danh sách, code block
+và ngữ cảnh tiêu đề. PDF phải được chuyển thành cấu trúc đáng tin cậy trước khi
+áp dụng regex Markdown.
+
+3.5. Đánh giá chunking
+
+Không chỉ đếm số chunk. Cần xem độ dài trung bình/tối thiểu/tối đa, tỷ lệ chunk
+quá ngắn, mức bảo toàn section, khả năng tìm lại evidence và chi phí embedding.
+Kích thước hiện trong config.py là số ký tự, không phải token; hai đơn vị không
+thể xem là tương đương.
+
+4. BIỂU DIỄN VÀ TRUY XUẤT
+-------------------------
+
+4.1. BM25 và tách từ tiếng Việt
+
+BM25 là sparse retrieval dựa trên mức hiếm của từ, tần suất từ trong tài liệu và
+độ dài tài liệu. Nó mạnh với tên riêng, số hiệu, Điều 13, ngày tháng và cụm từ
+chính xác.
+
+Tiếng Việt dùng khoảng trắng giữa các âm tiết, nên "dữ liệu cá nhân" không đơn
+giản là ba từ độc lập về mặt ngữ nghĩa. underthesea có thể nối từ ghép, thí dụ
+"dữ_liệu cá_nhân", giúp BM25 có ranh giới từ tốt hơn. Corpus và query phải dùng
+cùng một quy trình chuẩn hóa/tách từ.
+
+4.2. Dense retrieval
+
+Bi-encoder biến query và chunk thành vector trong cùng không gian; cosine
+similarity tìm các đoạn gần nghĩa dù không trùng từ. Dự án cấu hình BAAI/bge-m3,
+vector 1024 chiều và Qdrant.
+
+Cần hiểu:
+
+- vector dimension của collection phải khớp output model;
+- cùng một model và cùng quy tắc tiền xử lý phải được dùng khi index và query;
+- payload phải giữ text, chunk_id, source và metadata cần lọc;
+- không tái tạo collection ngoài ý muốn trong môi trường có dữ liệu thật;
+- collection baseline và production phải tách biệt.
+
+4.3. Hybrid retrieval và RRF
+
+BM25 bắt tốt từ khóa chính xác; dense bắt tốt ý nghĩa. Hybrid dùng cả hai để giảm
+điểm mù. Reciprocal Rank Fusion không cộng trực tiếp hai score khác thang đo mà
+cộng điểm theo thứ hạng:
+
+  RRF(d) = tổng của 1 / (k + rank_i(d)) trên các bảng hạng i.
+
+Một tài liệu đứng cao ở cả hai nhánh sẽ được ưu tiên. Cần thống nhất rank bắt đầu
+từ 1, loại trùng theo chunk_id ổn định và vẫn giữ metadata của kết quả gốc.
+
+5. RERANKING
+------------
+
+Bi-encoder mã hóa query và tài liệu riêng nên nhanh, phù hợp lấy top 20. Cross-
+encoder đọc đồng thời cặp query - document nên hiểu quan hệ sâu hơn nhưng chậm;
+vì vậy nó chỉ xếp hạng lại tập ứng viên nhỏ và chọn top 3.
+
+Cần biết cách:
+
+- lazy-load model một lần, không tải lại mỗi query;
+- tạo đúng danh sách cặp query/document;
+- xử lý output là scalar, list hoặc mảng;
+- sắp giảm dần và giữ original_score, rerank_score, metadata, rank;
+- đo cold-start riêng với warm latency;
+- warm-up trước benchmark và dùng time.perf_counter();
+- có fallback rõ ràng khi model không khả dụng, nhưng không giả là model đã chạy.
+
+Flashrank là lựa chọn nhẹ hơn. Khi so sánh, phải báo cả chất lượng lẫn latency,
+không chỉ chọn phương án nhanh nhất.
+
+6. ENRICHMENT
+-------------
+
+- Summary giảm nhiễu nhưng có nguy cơ bỏ mất con số hoặc điều kiện quan trọng.
+- HyQA sinh các câu hỏi mà chunk có thể trả lời, giúp thu hẹp khoảng cách từ vựng
+  giữa cách hỏi và cách tài liệu diễn đạt.
+- Contextual prepend bổ sung vị trí/chủ đề của chunk để đoạn rời vẫn có ngữ cảnh.
+- Auto metadata tạo topic, entities, category, language để hỗ trợ filter.
+
+Enrichment là công đoạn ngoại tuyến nhưng tốn tiền và thời gian. Cần cache theo
+hash của raw chunk, giới hạn retry, kiểm tra JSON từ LLM, giữ original_text và
+không để nội dung sinh ra thay thế bằng chứng gốc. Nếu ghép câu hỏi HyQA vào
+enriched_text thì vẫn phải trả raw/parent text cho LLM và citation.
+
+7. SINH CÂU TRẢ LỜI CÓ CĂN CỨ
+------------------------------
+
+Prompt nên:
+
+- yêu cầu chỉ dùng context đã cung cấp;
+- yêu cầu nói rõ "không tìm thấy" khi evidence không đủ;
+- bảo toàn số liệu, điều kiện, ngoại lệ và đơn vị;
+- ưu tiên câu trả lời ngắn, trực tiếp và có nguồn/trang nếu metadata hỗ trợ;
+- chống chỉ dẫn độc hại nằm trong tài liệu được truy xuất;
+- dùng nhiệt độ thấp cho câu hỏi tra cứu.
+
+Trả nguyên context đầu tiên chỉ là fallback retrieval, chưa phải bước generation.
+Để so sánh retrieval công bằng, baseline và production nên dùng cùng generator
+và prompt; nếu thay cả retrieval lẫn generator thì delta không chỉ thuộc về M1-M3.
+
+8. RAGAS VÀ THIẾT KẾ BỘ ĐÁNH GIÁ
+--------------------------------
+
+Bốn metric:
+
+- Faithfulness: các mệnh đề trong câu trả lời có được context hỗ trợ hay không.
+- Answer relevancy: câu trả lời có thực sự giải quyết câu hỏi hay không.
+- Context precision: các context tìm được có liên quan và được xếp cao hay không.
+- Context recall: context có chứa đủ thông tin cần thiết từ ground truth hay không.
+
+Chẩn đoán thường dùng:
+
+- context recall thấp -> ingestion, OCR, chunking hoặc retrieval bỏ sót;
+- context precision thấp -> truy xuất nhiều nhiễu, cần hybrid/rerank/filter;
+- faithfulness thấp -> generation suy diễn, prompt hoặc context gây mâu thuẫn;
+- answer relevancy thấp -> hiểu query hoặc prompt trả lời lệch trọng tâm.
+
+Bộ test phải là JSON hợp lệ, có question và ground_truth, bao phủ nhiều tài liệu
+và nhiều kiểu câu hỏi. Ground truth phải có bằng chứng trong corpus. Nên có câu
+hỏi trực tiếp, số liệu, điều/khoản, diễn đạt đồng nghĩa, nhiều bước và không đủ
+thông tin. Không dùng chính test set để viết hardcode hoặc tinh chỉnh đến mức rò
+rỉ dữ liệu.
+
+API và schema RAGAS thay đổi theo phiên bản. requirements.txt phải pin phiên bản
+phù hợp với các trường question/answer/contexts/ground_truth mà scaffold đang
+dùng, hoặc mã phải được cập nhật đồng bộ theo phiên bản đã chọn.
+
+9. FAILURE ANALYSIS VÀ ERROR TREE
+---------------------------------
+
+Với mỗi câu tệ nhất:
+
+1. Output có đúng không?
+2. Nếu sai, context có evidence đúng không?
+3. Nếu context thiếu: dữ liệu đã nạp/OCR đúng chưa, chunk đúng chưa, query và
+   retrieval có lấy đúng chunk không?
+4. Nếu context có evidence nhưng answer sai: kiểm tra rerank, prompt, context
+   window và generation.
+5. Gắn root cause vào đúng tầng và đề xuất một thay đổi đo được.
+
+Một diagnosis tốt phải trích evidence cụ thể và score, không chỉ viết "model
+chưa tốt". Sau khi sửa, chạy lại cùng test và báo delta để xác nhận giả thuyết.
+
+10. KIỂM THỬ VÀ CHẤT LƯỢNG MÃ
+------------------------------
+
+Cần thành thạo pytest, dataclass, type hint, JSON, regex, xử lý ngoại lệ và đo
+thời gian. Các trường hợp biên quan trọng gồm dữ liệu rỗng, chuỗi chỉ có khoảng
+trắng, top_k lớn hơn số tài liệu, score bằng nhau, metadata thiếu, API timeout,
+Qdrant chưa chạy và model tải thất bại.
+
+Test đơn vị chỉ xác nhận hợp đồng nhỏ; cần thêm smoke test đầu-cuối với tài liệu
+thật. Không dùng fallback rỗng hoặc điểm 0 để đánh đồng với triển khai đúng. Xóa
+toàn bộ TODO, chạy lint và giữ hàm ngắn, có kiểu trả về rõ ràng.
+
+11. MÔI TRƯỜNG, TÁI LẬP VÀ BẢO MẬT
+----------------------------------
+
+- Python 3.10 trở lên phù hợp cú pháp union type đang dùng.
+- Các nhóm thư viện cần biết: python-dotenv; công cụ PDF/OCR; underthesea;
+  rank-bm25; sentence-transformers/FlagEmbedding; qdrant-client; RAGAS;
+  datasets; OpenAI client; pytest và ruff.
+- Pin phiên bản dependency và ghi rõ cách khởi động Qdrant.
+- Chỉ lưu khóa trong .env, không commit .env hay in khóa vào log.
+- Ghi model, tham số chunk, top-k, RRF k, seed, thời gian và môi trường máy trong
+  báo cáo để kết quả có thể tái lập.
+- Theo dõi số chunk, số vector, latency từng tầng, lỗi API và chi phí enrichment.
+- Kiểm tra tệp báo cáo thực sự được Git theo dõi trước khi nộp.
+
+12. LIÊN HỆ KIẾN THỨC VỚI MÃ NGUỒN
+----------------------------------
+
+- config.py: cấu hình và tính tái lập.
+- m1_chunking.py: NLP, embedding similarity và cấu trúc tài liệu.
+- m2_search.py: sparse/dense retrieval, Qdrant và fusion.
+- m3_rerank.py: cross-encoder và latency.
+- m4_eval.py: RAGAS, thống kê, JSON report và Error Tree.
+- m5_enrichment.py: LLM ngoại tuyến, metadata và quản lý chi phí.
+- pipeline.py: hợp đồng dữ liệu giữa mô-đun, fallback và quan sát đầu-cuối.
+- tests/: kiểm tra hợp đồng; không thay thế kiểm chứng trên corpus thật.
+- analysis/: biến điểm số thành kết luận kỹ thuật và kế hoạch cải tiến.
